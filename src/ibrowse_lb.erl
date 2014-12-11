@@ -16,7 +16,7 @@
 %% External exports
 -export([
 	 start_link/1,
-	 spawn_connection/6,
+	 spawn_connection/7,
      stop/1,
      report_connection_down/1,
      report_request_complete/1
@@ -42,8 +42,8 @@
 
 -define(PIPELINE_MAX, 99999).
 -define(MAX_RETRIES, 3).
--define(KEY_MATCHSPEC_BY_PID(Pid), [{{{'_', '_', Pid}, '_'}, [], ['$_']}]).
--define(KEY_MATCHSPEC_BY_PID_FOR_DELETE(Pid), [{{{'_', '_', Pid}, '_'}, [], [true]}]).
+-define(KEY_MATCHSPEC_BY_PID(Pid), [{{{'_', '_', '_', Pid}, '_'}, [], ['$_']}]).
+-define(KEY_MATCHSPEC_BY_PID_FOR_DELETE(Pid), [{{{'_', '_', '_', Pid}, '_'}, [], [true]}]).
 -define(KEY_MATCHSPEC_FOR_DELETE(Key), [{{Key, '_'}, [], [true]}]).
 
 -include("ibrowse.hrl").
@@ -62,6 +62,7 @@ spawn_connection(Lb_pid,
                  Url,
                  Max_sessions,
                  Max_pipeline_size,
+                 Max_Requests,
                  SSL_options,
                  Process_options)
                  when is_pid(Lb_pid),
@@ -69,7 +70,7 @@ spawn_connection(Lb_pid,
                       is_integer(Max_pipeline_size),
                       is_integer(Max_sessions) ->
     gen_server:call(Lb_pid,
-		    {spawn_connection, Url, Max_sessions, Max_pipeline_size, SSL_options, Process_options}).
+		    {spawn_connection, Url, Max_sessions, Max_pipeline_size, Max_Requests, SSL_options, Process_options}).
 
 stop(Lb_pid) ->
     case catch gen_server:call(Lb_pid, stop) of
@@ -133,7 +134,7 @@ handle_call(stop, _From, #state{ets_tid = Tid} = State) ->
 handle_call(_, _From, #state{proc_state = shutting_down} = State) ->
     {reply, {error, shutting_down}, State};
 
-handle_call({spawn_connection, Url, Max_sess, Max_pipe, SSL_options, Process_options}, _From, State) ->
+handle_call({spawn_connection, Url, Max_sess, Max_pipe, Max_Requests, SSL_options, Process_options}, _From, State) ->
     State_1 = maybe_create_ets(State),
     Tid = State_1#state.ets_tid,
     Reply = case num_current_connections(Tid) of
@@ -141,7 +142,7 @@ handle_call({spawn_connection, Url, Max_sess, Max_pipe, SSL_options, Process_opt
             find_best_connection(Tid, Max_pipe);
         _ ->
             Result = {ok, Pid} = ibrowse_http_client:start_link({Tid, Url, SSL_options}, Process_options),
-            record_new_connection(Tid, Pid),
+            record_new_connection(Tid, Pid, Max_Requests),
             Result
     end,
     {reply, Reply, State_1#state{max_sessions = Max_sess, max_pipeline_size = Max_pipe}};
@@ -221,7 +222,7 @@ find_best_connection(_Tid, _Max_pipeline_size, 0) ->
     {error, retry_later};
 find_best_connection(Tid, Max_pipeline_size, RemainingRetries) ->
     case ets:first(Tid) of
-        {Size, _Timestamp, Pid} = Key when Size < Max_pipeline_size ->
+        {Size, _RemainingRequests, _Timestamp, Pid} = Key when Size < Max_pipeline_size ->
             case record_request_for_connection(Tid, Key) of
                 true ->
                     {ok, Pid};
@@ -242,13 +243,18 @@ maybe_create_ets(State) ->
 num_current_connections(Tid) ->
     catch ets:info(Tid, size).
 
-record_new_connection(Tid, Pid) ->
-    catch ets:insert(Tid, {new_key(Pid), undefined}).
+record_new_connection(Tid, Pid, MaxRequests) ->
+    catch ets:insert(Tid, {new_key(Pid, MaxRequests), undefined}).
 
 record_request_for_connection(Tid, Key) ->
     case ets:select_delete(Tid, ?KEY_MATCHSPEC_FOR_DELETE(Key)) of
         1 ->
-            ets:insert(Tid, {incremented(Key), undefined}),
+            case decrement_key_requests(Key) of
+                used_up ->
+                    ok;
+                NewKey ->
+                    ets:insert(Tid, {incremented(NewKey), undefined})
+            end,
             true;
         _ ->
             false
@@ -272,14 +278,21 @@ report_request_complete(Tid, RemainingRetries) ->
     end.
 
 
-new_key(Pid) ->
-    {1, os:timestamp(), Pid}.
+new_key(Pid, MaxRequests) ->
+    {1, MaxRequests, os:timestamp(), Pid}.
 
-incremented({Size, Timestamp, Pid}) ->
-    {Size + 1, Timestamp, Pid}.
+incremented({Size, RemainingRequests, Timestamp, Pid}) ->
+    {Size + 1, RemainingRequests, Timestamp, Pid}.
 
-decremented({Size, _Timestamp, Pid}) ->
-    {Size - 1, os:timestamp(), Pid}.
+decremented({Size, RemainingRequests, _Timestamp, Pid}) ->
+    {Size - 1, RemainingRequests, os:timestamp(), Pid}.
+
+decrement_key_requests({_, infinity, _, _} = Key) ->
+    Key;
+decrement_key_requests({_, RemainingRequests, _, _}) when RemainingRequests < 0 ->
+    used_up;
+decrement_key_requests({Size, RemainingRequests, TimeStamp, Pid}) ->
+    {Size, RemainingRequests - 1, TimeStamp, Pid}.
 
 for_each_connection_pid(Tid, Fun) ->
     catch ets:foldl(fun({Pid, _}, _) -> Fun(Pid) end, undefined, Tid),

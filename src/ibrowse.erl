@@ -118,8 +118,9 @@
 -include("ibrowse.hrl").
 -include_lib("stdlib/include/ms_transform.hrl").
 
--define(DEF_MAX_SESSIONS,10).
--define(DEF_MAX_PIPELINE_SIZE,10).
+-define(DEF_MAX_SESSIONS, 10).
+-define(DEF_MAX_PIPELINE_SIZE, 10).
+-define(DEF_MAX_REQUESTS, infinity).
 
 %%====================================================================
 %% External functions
@@ -325,6 +326,7 @@ send_req(Url, Headers, Method, Body, Options, Timeout) ->
                      end,
             Max_sessions = get_max_sessions(Host, Port, Options),
             Max_pipeline_size = get_max_pipeline_size(Host, Port, Options),
+            Max_Requests = get_max_requests(Host, Port, Options),
             Options_1 = merge_options(Host, Port, Options),
             {SSLOptions, IsSSL} =
                 case (Protocol == https) orelse
@@ -335,6 +337,7 @@ send_req(Url, Headers, Method, Body, Options, Timeout) ->
             try_routing_request(Lb_pid, Parsed_url,
                                 Max_sessions, 
                                 Max_pipeline_size,
+                                Max_Requests,
                                 {SSLOptions, IsSSL}, 
                                 Headers, Method, Body, Options_1, Timeout, 0);
         Err ->
@@ -344,12 +347,14 @@ send_req(Url, Headers, Method, Body, Options, Timeout) ->
 try_routing_request(Lb_pid, Parsed_url,
                     Max_sessions, 
                     Max_pipeline_size,
+                    Max_Requests,
                     {SSLOptions, IsSSL}, 
                     Headers, Method, Body, Options_1, Timeout, Try_count) when Try_count < 3 ->
     ProcessOptions = get_value(worker_process_options, Options_1, []),
     case ibrowse_lb:spawn_connection(Lb_pid, Parsed_url,
                                              Max_sessions, 
                                              Max_pipeline_size,
+                                             Max_Requests,
                                              {SSLOptions, IsSSL},
                                              ProcessOptions) of
         {ok, Conn_Pid} ->
@@ -359,6 +364,7 @@ try_routing_request(Lb_pid, Parsed_url,
                     try_routing_request(Lb_pid, Parsed_url,
                                         Max_sessions, 
                                         Max_pipeline_size,
+                                        Max_Requests,
                                         {SSLOptions, IsSSL}, 
                                         Headers, Method, Body, Options_1, Timeout, Try_count + 1);
                 Res ->
@@ -367,7 +373,7 @@ try_routing_request(Lb_pid, Parsed_url,
         Err ->
             Err
     end;
-try_routing_request(_, _, _, _, _, _, _, _, _, _, _) ->
+try_routing_request(_, _, _, _, _, _, _, _, _, _, _, _) ->
     {error, retry_later}.
 
 merge_options(Host, Port, Options) ->
@@ -396,11 +402,19 @@ get_max_pipeline_size(Host, Port, Options) ->
               get_config_value({max_pipeline_size, Host, Port},
                                default_max_pipeline_size())).
 
+get_max_requests(Host, Port, Options) ->
+    get_value(max_requests, Options,
+              get_config_value({max_requests, Host, Port},
+                               default_max_requests())).
+
 default_max_sessions() ->
     safe_get_env(ibrowse, default_max_sessions, ?DEF_MAX_SESSIONS).
 
 default_max_pipeline_size() ->
     safe_get_env(ibrowse, default_max_pipeline_size, ?DEF_MAX_PIPELINE_SIZE).
+
+default_max_requests() ->
+    safe_get_env(ibrowse, default_max_requests, ?DEF_MAX_REQUESTS).
 
 safe_get_env(App, Key, Def_val) ->
     case application:get_env(App, Key) of
